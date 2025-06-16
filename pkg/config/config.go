@@ -4,6 +4,7 @@
 package config
 
 import (
+//	"flag"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -42,3 +43,30 @@ func SaveFile(filename string, cfg interface{}) error {
 	}
 	return osutil.WriteFile(filename, data)
 }
+
+// add for syzvegas
+type FuzzerConfig struct {		
+	ExecuteRetries     int
+	SignalRunThreshold float64
+	NoMinimization     bool
+	GenerateWeight     int
+	MutateWeight       int
+	SmashWeight        int
+	SyncTriage         bool
+	SyncSmash          bool
+	VerifyFirst        bool
+
+	MABAlgorithm     string
+	MABSeedSelection string
+	MABTargetCorpus  bool
+	MABVerbose       bool
+	ProgVerbose      bool
+	MABTimeUnit      float64
+	MABTriageFirst   bool
+	MABZLogNormalize bool
+	MABNormalize     int
+	MABExp31         bool
+	MABDuration      int
+	MABGenerateFirst int
+	MABNoMutations   int
+} 

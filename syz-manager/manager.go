@@ -242,6 +242,7 @@ func main() {
 		cfg.DashboardClient = ""
 		cfg.HubClient = ""
 	}
+	fmt.Fprintf(os.Stdout, "<<<%v>>>\n", time.Now().UnixNano())
 	RunManager(mode, cfg)
 }
 
@@ -378,6 +379,7 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 	go mgr.trackUsedFiles()
 	go mgr.processFuzzingResults(ctx)
 	mgr.pool.Loop(ctx)
+	fmt.Fprintf(os.Stdout, "<<<%v>>>\n", time.Now().UnixNano())
 }
 
 // Exit successfully in special operation modes.
@@ -651,7 +653,11 @@ func (mgr *Manager) runInstanceInner(ctx context.Context, inst *vm.Instance, inj
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse manager's address")
 	}
-	cmd := fmt.Sprintf("%v runner %v %v %v", executorBin, inst.Index(), host, port)
+	fuzzerConfig := make(map[string]interface{})
+	if err := json.Unmarshal(mgr.cfg.FuzzerConfig, &fuzzerConfig); err != nil {
+		fmt.Printf("failed to parse fuzzer config. Using default.\n%v", err)
+	}
+	cmd := fmt.Sprintf("%v runner %v %v %v %v %v", executorBin, inst.Index(), host, port, mgr.cfg.Feedback, fuzzerConfig)
 	_, rep, err := inst.Run(mgr.cfg.Timeouts.VMRunningTime, mgr.reporter, cmd,
 		vm.ExitTimeout, vm.StopContext(ctx), vm.InjectExecuting(injectExec),
 		finishCb,

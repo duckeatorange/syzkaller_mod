@@ -25,6 +25,7 @@ type Request struct {
 	// RequestTypeProgram executes Prog, and is used by most requests (also the default zero value).
 	// RequestTypeBinary executes binary with file name stored in Data.
 	// RequestTypeGlob expands glob pattern stored in Data.
+	MAB_TYPE    int			// 0 for Generate, 1 for Mutate, 2 for Triage
 	Type        flatrpc.RequestType
 	ExecOpts    flatrpc.ExecOpts
 	Prog        *prog.Prog // for RequestTypeProgram
@@ -183,6 +184,9 @@ type Result struct {
 	Output   []byte
 	Status   Status
 	Err      error // More details in case of ExecFailure.
+	GainRaw  float64
+	Time     float64
+	Calls	 int
 }
 
 func (r *Result) clone() *Result {
@@ -362,6 +366,12 @@ func DynamicOrder() *DynamicOrderer {
 	return &DynamicOrderer{
 		ops: &priorityQueueOps[*Request]{},
 	}
+}
+
+func (do *DynamicOrderer) Len() int {
+	do.mu.Lock()
+	defer do.mu.Unlock()
+	return do.ops.Len()
 }
 
 func (do *DynamicOrderer) Append() Executor {

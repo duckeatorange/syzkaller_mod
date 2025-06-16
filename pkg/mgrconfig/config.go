@@ -230,6 +230,10 @@ type Config struct {
 
 	// Implementation details beyond this point. Filled after parsing.
 	Derived `json:"-"`
+
+	// add for syzvegas
+	Feedback     string          `json:"feedback"`
+	FuzzerConfig json.RawMessage `json:"fuzzer_config"`
 }
 
 // These options are not guaranteed to be backward/forward compatible and

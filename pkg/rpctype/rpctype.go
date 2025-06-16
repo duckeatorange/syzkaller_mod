@@ -5,6 +5,11 @@
 // between syz-manager and syz-hub.
 package rpctype
 
+import (
+	"github.com/google/syzkaller/pkg/glc"
+	"github.com/google/syzkaller/pkg/hash"
+)
+
 type HubConnectArgs struct {
 	// Client/Key are used for authentication.
 	Client string
@@ -55,4 +60,29 @@ type HubInput struct {
 	// Domain of the source manager.
 	Domain string
 	Prog   []byte
+	Sig    hash.Sig
+	GLC    glc.CorpusGLC
+}
+
+type RPCTriage struct {
+	Sig        hash.Sig
+	CallIndex  int
+	Prog       []byte
+	Flags      int
+	// Info       ipc.CallInfo
+	Source     int
+	SourceCost float64
+}
+
+type TriageArgs struct {
+	Name string
+	RPCTriage
+}
+
+type RPCMABStatus struct {
+	Round      int
+	Exp31Round int
+	MABGLC     glc.MABGLC
+	CorpusGLC  map[hash.Sig]glc.CorpusGLC
+	TriageInfo map[hash.Sig]*glc.TriageInfo
 }

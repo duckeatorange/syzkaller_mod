@@ -23,6 +23,8 @@ func (p *Prog) cloneWithMap(newargs map[*ResultArg]*ResultArg) *Prog {
 	p1 := &Prog{
 		Target: p.Target,
 		Calls:  cloneCalls(p.Calls, newargs),
+		Source:    p.Source,
+		CorpusGLC: p.CorpusGLC,
 	}
 	p1.debugValidate()
 	return p1

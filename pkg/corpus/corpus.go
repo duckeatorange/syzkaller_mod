@@ -8,11 +8,14 @@ import (
 	"fmt"
 	"maps"
 	"sync"
+//	"strings"
+//	"math"
 
 	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/pkg/stat"
+	"github.com/google/syzkaller/pkg/glc"
 	"github.com/google/syzkaller/prog"
 )
 
@@ -32,6 +35,10 @@ type Corpus struct {
 	StatCover  *stat.Val
 
 	focusAreas []*focusAreaState
+
+	sumPrios       float64
+    corpusPrios    []float64
+    corpusPriosSum []float64
 }
 
 type focusAreaState struct {
@@ -115,6 +122,7 @@ type NewInput struct {
 	Signal   signal.Signal
 	Cover    []uint64
 	RawCover []uint64
+	CorpusGLC glc.CorpusGLC
 }
 
 type NewItemEvent struct {
@@ -124,7 +132,8 @@ type NewItemEvent struct {
 	NewCover []uint64
 }
 
-func (corpus *Corpus) Save(inp NewInput) {
+func (corpus *Corpus) Save(inp NewInput) int {
+	pidx := -1 // If duplicate seed, do not set pidx
 	progData := inp.Prog.Serialize()
 	sig := hash.String(progData)
 
@@ -160,6 +169,12 @@ func (corpus *Corpus) Save(inp NewInput) {
 		corpus.progsMap[sig] = newItem
 		corpus.applyFocusAreas(newItem, inp.Cover)
 	} else {
+		// prio := float64(len(inp.Signal))
+        // if inp.Signal.Empty() {
+        //     prio = 1.0
+        // } else if strings.Contains(fuzzer.fuzzerConfig.MABSeedSelection, "Exp3") { 
+        //     prio = math.Exp(fuzzer.MABCorpusEta * inp.Prog.CorpusGLC.MutateGainNormOrig) 
+        // }
 		item := &Item{
 			Sig:     sig,
 			Call:    inp.Call,
@@ -172,6 +187,11 @@ func (corpus *Corpus) Save(inp NewInput) {
 		corpus.progsMap[sig] = item
 		corpus.applyFocusAreas(item, inp.Cover)
 		corpus.saveProgram(inp.Prog, inp.Signal)
+
+        // corpus.sumPrios += prio
+        pidx = len(corpus.progsMap) - 1 
+        // corpus.corpusPrios = append(corpus.corpusPrios, prio)
+        // corpus.corpusPriosSum = append(corpus.corpusPriosSum, corpus.sumPrios)
 	}
 	corpus.signal.Merge(inp.Signal)
 	newCover := corpus.cover.MergeDiff(inp.Cover)
@@ -186,6 +206,7 @@ func (corpus *Corpus) Save(inp NewInput) {
 		}:
 		}
 	}
+	return pidx
 }
 
 func (corpus *Corpus) applyFocusAreas(item *Item, coverDelta []uint64) {

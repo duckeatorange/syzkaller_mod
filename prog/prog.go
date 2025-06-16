@@ -6,6 +6,7 @@ package prog
 import (
 	"fmt"
 	"reflect"
+	"github.com/google/syzkaller/pkg/glc"
 )
 
 type Prog struct {
@@ -15,6 +16,9 @@ type Prog struct {
 
 	// Was deserialized using Unsafe mode, so can do unsafe things.
 	isUnsafe bool
+	Source int // Gen: 0, Mut: 1, Tri: 2
+
+	CorpusGLC glc.CorpusGLC
 }
 
 const ExtraCallName = ".extra"
@@ -512,4 +516,8 @@ func (props *CallProps) ForeachProp(f func(fieldName, key string, value reflect.
 		fieldType := typeObj.Field(i)
 		f(fieldType.Name, fieldType.Tag.Get("key"), fieldValue)
 	}
+}
+
+func (p *Prog) ResetMAB() {
+	p.CorpusGLC = glc.CorpusGLC{}
 }

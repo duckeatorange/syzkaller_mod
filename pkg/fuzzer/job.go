@@ -6,6 +6,7 @@ package fuzzer
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"math/rand"
 	"strings"
 	"sync"
@@ -17,11 +18,42 @@ import (
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
 	"github.com/google/syzkaller/pkg/signal"
+	"github.com/google/syzkaller/pkg/hash"
+	"github.com/google/syzkaller/pkg/rpctype"
+	"github.com/google/syzkaller/pkg/glc"
 	"github.com/google/syzkaller/prog"
 )
 
+// add for syzvegas
+type ExecResult struct {
+	gainRaw   float64
+	time      float64
+	timeTotal float64
+	calls     int
+	count     int
+	pidx      int
+}
+
+type TriageResult struct {
+	corpusGainRaw    float64 // # sigs added to the corpus
+	verifyGainRaw    float64 // # of sigs discovered by stablization
+	verifyTime       float64
+	verifyCalls      int
+	minimizeGainRaw  float64 // # of sigs discovered by minimization
+	minimizeTime     float64
+	minimizeTimeSave float64
+	minimizeCalls    int
+	source           int
+	sourceSig        hash.Sig
+	sourceCost       float64
+	pidx             int
+	success          bool
+	timeTotal        float64
+}
+
+
 type job interface {
-	run(fuzzer *Fuzzer)
+	run(fuzzer *Fuzzer) 
 }
 
 type jobIntrospector interface {
@@ -45,6 +77,7 @@ func genProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 	p := fuzzer.target.Generate(rnd,
 		prog.RecommendedCalls,
 		fuzzer.ChoiceTable())
+	fuzzer.logProgram(p)
 	return &queue.Request{
 		Prog:     p,
 		ExecOpts: setFlags(flatrpc.ExecFlagCollectSignal),
@@ -53,17 +86,23 @@ func genProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 }
 
 func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
-	p := fuzzer.Config.Corpus.ChooseProgram(rnd)
+	_, p := fuzzer.Config.Corpus.ChooseProgram(rnd)
 	if p == nil {
 		return nil
 	}
+	fuzzer.logProgram(p)
 	newP := p.Clone()
+	p.ResetMAB()
 	newP.Mutate(rnd,
 		prog.RecommendedCalls,
 		fuzzer.ChoiceTable(),
 		fuzzer.Config.NoMutateCalls,
 		fuzzer.Config.Corpus.Programs(),
 	)
+	fuzzer.logProgram(newP)
+	/* if fuzzer.fuzzerConfig.MABSeedSelection != "N/A" {
+		fuzzer.MABUpdateWeight(1, r, []float64{1.0, 1.0, 1.0}, 1.0)
+	} */
 	return &queue.Request{
 		Prog:     newP,
 		ExecOpts: setFlags(flatrpc.ExecFlagCollectSignal),
@@ -90,6 +129,7 @@ type triageJob struct {
 type triageCall struct {
 	errno     int32
 	newSignal signal.Signal
+	info 	  *flatrpc.CallInfo
 
 	// Filled after deflake:
 	signals         [deflakeNeedRuns]signal.Signal
@@ -130,13 +170,52 @@ const (
 	deflakeNeedSnapshotRuns = 2
 )
 
-func (job *triageJob) execute(req *queue.Request, flags ProgFlags) *queue.Result {
+func (job *triageJob) execute(req *queue.Request, flags ProgFlags) (*queue.Result, float64) {		// original code: proc.go/executeRaw(200108)
+	ts := time.Now().UnixNano()
 	defer job.info.Execs.Add(1)
 	req.Important = true // All triage executions are important.
-	return job.fuzzer.executeWithFlags(job.queue, req, flags)
+	ts_end := time.Now().UnixNano()
+	return job.fuzzer.executeWithFlags(job.queue, req, flags), float64(ts_end-ts) / job.fuzzer.fuzzerConfig.MABTimeUnit
 }
 
-func (job *triageJob) run(fuzzer *Fuzzer) {
+func (job *triageJob) run(fuzzer *Fuzzer) TriageResult {			// original code: proc.go/trageInput(200108)
+	ts_bgn := time.Now().UnixNano()
+	source_data := job.p.Serialize()
+	source_sig := hash.Hash(source_data)
+	if fuzzer.fuzzerConfig.SyncTriage {
+		fuzzer.completeTriage(rpctype.RPCTriage{
+			Sig:        source_sig,
+			// CallIndex:  job.call,
+			Prog:       source_data,
+			Flags:      int(job.flags),
+			// Info:       job.info,
+			Source:     job.p.Source,
+			SourceCost: job.p.CorpusGLC.Cost,
+		})
+	}
+	source := job.p.Source
+	sourceCost := job.p.CorpusGLC.Cost
+	if _, ok := fuzzer.MABTriageInfo[source_sig]; ok {
+		source = fuzzer.MABTriageInfo[source_sig].Source
+		sourceCost = fuzzer.MABTriageInfo[source_sig].SourceCost
+	}
+	ret := TriageResult{
+		corpusGainRaw:    0.0,
+		minimizeGainRaw:  0.0,
+		verifyGainRaw:    0.0,
+		verifyTime:       0.0,
+		verifyCalls:      0,
+		minimizeTime:     0.0,
+		minimizeCalls:    0,
+		source:           source,
+		sourceSig:        source_sig,
+		sourceCost:       sourceCost,
+		minimizeTimeSave: 0.0,
+		pidx:             -1,
+		success:          false,
+		timeTotal:        0.0,
+	}
+	size_bgn := len(job.p.Calls)
 	fuzzer.statNewInputs.Add(1)
 	job.fuzzer = fuzzer
 	job.info.Logf("\n%s", job.p.Serialize())
@@ -146,47 +225,103 @@ func (job *triageJob) run(fuzzer *Fuzzer) {
 	}
 
 	// Compute input coverage and non-flaky signal for minimization.
-	stop := job.deflake(job.execute)
+	stop := job.deflake(func(req *queue.Request, flags ProgFlags) *queue.Result {
+		result, _ := job.execute(req, flags) 
+		return result
+	}, &ret, ts_bgn, size_bgn)
 	if stop {
-		return
+		return ret
 	}
 	var wg sync.WaitGroup
 	for call, info := range job.calls {
 		wg.Add(1)
 		go func() {
-			job.handleCall(call, info)
+			job.handleCall(call, info, &ret)				// add ret for syzvegas
 			wg.Done()
 		}()
 	}
 	wg.Wait()
+	ts_end := time.Now().UnixNano()
+	ret.timeTotal = float64(ts_end-ts_bgn) / job.fuzzer.fuzzerConfig.MABTimeUnit
+	// ret.minimizeGainRaw = minimizeGainRaw
+	// ret.corpusGainRaw = corpusGainRaw
+	// ret.minimizeTimeSave = sourceCost - minimizeTimeAfter
+	// ret.minimizeTime = t_minimize
+	// ret.verifyTime = t_corpus
+	// ret.minimizeCalls = minimizeCalls
+	// ret.verifyCalls = size_bgn * signalRuns
+	ret.success = true
+	return ret
 }
 
-func (job *triageJob) handleCall(call int, info *triageCall) {
+func (job *triageJob) handleCall(call int, info *triageCall, ret *TriageResult) {
 	if info.newStableSignal.Empty() {
 		return
 	}
 
+	// add for syzvegas
+	const signalRuns = 3
+	minimizeGainRaw := 0.0
+	sourceCost := ret.sourceCost
+	data := job.p.Serialize()
+	sig := hash.Hash(data)
+
+	ret.success = true
+	if ret.sourceCost == 0.0 {
+		ret.sourceCost = ret.verifyTime / 3.0
+	} else {
+		ret.sourceCost = (ret.verifyTime + ret.sourceCost) / 4.0
+	}
+	job.fuzzer.writeLog("# %v Minimize\n", 0)
+	job.fuzzer.logProgram(job.p)
+	minimizeCalls := 0
+	
+	minimizeTimeAfter := ret.sourceCost
+	size_bgn := len(job.p.Calls)
+
+	ret.minimizeGainRaw = minimizeGainRaw
+	ret.minimizeTimeSave = sourceCost - minimizeTimeAfter
+	ret.minimizeCalls = minimizeCalls
+	ret.verifyCalls = size_bgn * signalRuns
+
 	p := job.p
-	if job.flags&ProgMinimized == 0 {
-		p, call = job.minimize(call, info)
+	if job.flags&ProgMinimized == 0 {				//original code: proc.go/trageInput(200108)
+		job.fuzzer.writeLog("%s\n", "# Minimize Attempt")
+		p, call = job.minimize(call, info, *ret)
 		if p == nil {
 			return
 		}
 	}
+	job.fuzzer.writeLog("%s\n", "# Minimize Final")
+	job.fuzzer.logProgram(job.p)
+
+	prio := signalPrio(job.p, info.info, call)
+	inputSignal := signal.FromRaw(info.info.Signal, prio)
+	newSignal := job.fuzzer.corpusSignalDiff(inputSignal)
+
+	corpusGainRaw := 0.0
+	if len(inputSignal) > 0 {
+		corpusGainRaw = float64(len(newSignal))
+	}
+	ret.corpusGainRaw = corpusGainRaw
+
 	callName := p.CallName(call)
 	if !job.fuzzer.Config.NewInputFilter(callName) {
 		return
 	}
 	if job.flags&ProgSmashed == 0 {
-		job.fuzzer.startJob(job.fuzzer.statJobsSmash, &smashJob{
-			exec: job.fuzzer.smashQueue,
-			p:    p.Clone(),
-			info: &JobInfo{
-				Name:  p.String(),
-				Type:  "smash",
-				Calls: []string{p.CallName(call)},
-			},
-		})
+		numSmashes := int(math.Floor(float64(job.fuzzer.fuzzerConfig.SmashWeight) / float64(job.fuzzer.fuzzerConfig.MutateWeight)))
+		for i := 0; i < numSmashes; i++ {
+			job.fuzzer.startJob(job.fuzzer.statJobsSmash, &smashJob{
+				exec: job.fuzzer.smashQueue,
+				p:    p.Clone(),
+				info: &JobInfo{
+					Name:  p.String(),
+					Type:  "smash",
+					Calls: []string{p.CallName(call)},
+				},
+			}, job.fuzzer.smashQueue.Next())
+		}
 		if job.fuzzer.Config.Comparisons && call >= 0 {
 			job.fuzzer.startJob(job.fuzzer.statJobsHints, &hintsJob{
 				exec: job.fuzzer.smashQueue,
@@ -197,16 +332,17 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 					Type:  "hints",
 					Calls: []string{p.CallName(call)},
 				},
-			})
+			}, job.fuzzer.smashQueue.Next())
 		}
 		if job.fuzzer.Config.FaultInjection && call >= 0 {
 			job.fuzzer.startJob(job.fuzzer.statJobsFaultInjection, &faultInjectionJob{
 				exec: job.fuzzer.smashQueue,
 				p:    p.Clone(),
 				call: call,
-			})
+			}, job.fuzzer.smashQueue.Next())
 		}
 	}
+
 	job.fuzzer.Logf(2, "added new input for %v to the corpus: %s", callName, p)
 	input := corpus.NewInput{
 		Prog:     p,
@@ -214,11 +350,20 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 		Signal:   info.stableSignal,
 		Cover:    info.cover.Serialize(),
 		RawCover: info.rawCover,
+		CorpusGLC: glc.CorpusGLC{
+			VerifyGain:       0.0,
+			VerifyCost:       ret.verifyTime,
+			MinimizeGain:     minimizeGainRaw,
+			MinimizeCost:     ret.minimizeTime,
+			MinimizeTimeSave: sourceCost - minimizeTimeAfter,
+		},
 	}
+	job.fuzzer.writeLog("# addInputToCorpus %x: %v. Source: %v\n", sig, job.fuzzer.corpusSignal.Len(), ret.source)
+	job.fuzzer.logSignal(inputSignal, "+")
 	job.fuzzer.Config.Corpus.Save(input)
 }
 
-func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result) (stop bool) {
+func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result, ret *TriageResult, ts_bgn int64, size_bgn int) (stop bool) {			// add ret for syzvegas
 	job.info.Logf("deflake started")
 
 	avoid := []queue.ExecutorID{job.executor}
@@ -240,14 +385,18 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 			break
 		}
 		prevTotalNewSignal = totalNewSignal
-		result := exec(&queue.Request{
+		result, _time:= job.execute(&queue.Request{
 			Prog:            job.p,
 			ExecOpts:        setFlags(flatrpc.ExecFlagCollectCover | flatrpc.ExecFlagCollectSignal),
 			ReturnAllSignal: indices,
 			Avoid:           avoid,
 			Stat:            job.fuzzer.statExecTriage,
 		}, progInTriage)
+		ret.verifyTime += _time
 		if result.Stop() {
+			ret.timeTotal = float64(time.Now().UnixNano()-ts_bgn) / job.fuzzer.fuzzerConfig.MABTimeUnit
+			ret.verifyCalls = (run + 1) * size_bgn
+			ret.corpusGainRaw = 0.0
 			return true
 		}
 		avoid = append(avoid, result.Executor)
@@ -340,7 +489,7 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool) bool {
 	return false
 }
 
-func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
+func (job *triageJob) minimize(call int, info *triageCall, ret TriageResult) (*prog.Prog, int) {
 	job.info.Logf("[call #%d] minimize started", call)
 	minimizeAttempts := 3
 	if job.fuzzer.Config.Snapshot {
@@ -356,8 +505,14 @@ func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
 			return false
 		}
 		var mergedSignal signal.Signal
+		job.fuzzer.writeLog("%s\n", "# Minimize Attempt")
+		p1.Source = 2
+		job.fuzzer.logProgram(p1)
+		t_avg := 0.0
+		ret.minimizeCalls = 0
+		ret.minimizeGainRaw = 0.0
 		for i := 0; i < minimizeAttempts; i++ {
-			result := job.execute(&queue.Request{
+			result, _ := job.execute(&queue.Request{
 				Prog:            p1,
 				ExecOpts:        setFlags(flatrpc.ExecFlagCollectSignal),
 				ReturnAllSignal: []int{call1},
@@ -367,6 +522,8 @@ func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
 				stop = true
 				return false
 			}
+			ret.minimizeCalls += len(p1.Calls)
+			ret.minimizeGainRaw += result.GainRaw
 			if !reexecutionSuccess(result.Info, info.errno, call1) {
 				// The call was not executed or failed.
 				continue
@@ -380,6 +537,7 @@ func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
 			if info.newStableSignal.Intersection(mergedSignal).Len() == info.newStableSignal.Len() {
 				job.info.Logf("[call #%d] minimization step success (|calls| = %d)",
 					call, len(p1.Calls))
+				t_avg = t_avg / float64(i+1)
 				return true
 			}
 		}
@@ -444,28 +602,66 @@ type smashJob struct {
 	info *JobInfo
 }
 
-func (job *smashJob) run(fuzzer *Fuzzer) {
+func (job *smashJob) run(fuzzer *Fuzzer) ExecResult {						// original code: proc.go/smashInput(200108)
+	ret := ExecResult{
+		gainRaw:   0.0,
+		time:      0.0,
+		calls:     0,
+		pidx:      -1,
+		count:     0,
+		timeTotal: 0.0,
+	}
+	ts_bgn := time.Now().UnixNano()
+	sig := hash.Hash(job.p.Serialize())
 	fuzzer.Logf(2, "smashing the program %s:", job.p)
 	job.info.Logf("\n%s", job.p.Serialize())
+
+	// fuzzerSnapshot := job.fuzzer.snapshot()
+	pidx := -1
+	if v, ok := fuzzer.corpusHashes[sig]; ok {
+		pidx = v
+		ret.pidx = pidx
+	}
+	// Mark for update if we're syncing smash
+	if pidx > 0 && fuzzer.fuzzerConfig.SyncSmash {
+		fuzzer.MABCorpusUpdate[pidx] = 1
+		job.p.CorpusGLC.Smashed = true
+		fuzzer.smashesFinished = append(fuzzer.smashesFinished, sig)
+	}
 
 	const iters = 25
 	rnd := fuzzer.rand()
 	for i := 0; i < iters; i++ {
 		p := job.p.Clone()
+		p.ResetMAB()
+		fuzzer.writeLog("# %v Mutate Smash\n", i)
+		fuzzer.logProgram(p)
 		p.Mutate(rnd, prog.RecommendedCalls,
 			fuzzer.ChoiceTable(),
 			fuzzer.Config.NoMutateCalls,
 			fuzzer.Config.Corpus.Programs())
+		fuzzer.logProgram(p)
 		result := fuzzer.execute(job.exec, &queue.Request{
 			Prog:     p,
 			ExecOpts: setFlags(flatrpc.ExecFlagCollectSignal),
 			Stat:     fuzzer.statExecSmash,
 		})
+		if fuzzer.fuzzerConfig.MABAlgorithm == "N/A" && fuzzer.fuzzerConfig.MABSeedSelection == "N/A" && fuzzer.fuzzerConfig.SyncSmash {
+			// Without MAB, we need to count mutations for smash syncing
+			fuzzer.MABIncrementCorpusMutateCount(pidx, 1)
+		}
 		if result.Stop() {
-			return
+			return ret
 		}
 		job.info.Execs.Add(1)
+		ret.count += 1
+		ret.calls += result.Calls
+		ret.gainRaw += result.GainRaw
+		ret.time += result.Time
 	}
+	ts_end := time.Now().UnixNano()
+	ret.timeTotal = float64(ts_end-ts_bgn) / fuzzer.fuzzerConfig.MABTimeUnit
+	return ret
 }
 
 func (job *smashJob) getInfo() *JobInfo {

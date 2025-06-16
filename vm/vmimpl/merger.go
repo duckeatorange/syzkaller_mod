@@ -45,6 +45,33 @@ func (merger *OutputMerger) Add(name string, r io.ReadCloser) {
 	merger.AddDecoder(name, r, nil)
 }
 
+// add for syzvegas
+func (merger *OutputMerger) FilterWrite(out []byte) {
+	buf := make([]byte, 0)
+	logging := false
+	newline := true
+	for _, c := range out {
+		if newline {
+			if c == '-' || c == '=' || c == '#' || c == '<' || c == '>' || c == '+' {
+				buf = append(buf, c)
+				logging = true
+				newline = false
+			} else if c != '\n' {
+				logging = false
+				newline = false
+			}
+		} else if c == '\n' {
+			if logging {
+				buf = append(buf, c)
+			}
+			newline = true
+		} else if logging {
+			buf = append(buf, c)
+		}
+	}
+	merger.tee.Write(buf)
+}
+
 func (merger *OutputMerger) AddDecoder(name string, r io.ReadCloser,
 	decoder func(data []byte) (start, size int, decoded []byte)) {
 	merger.wg.Add(1)
@@ -73,7 +100,7 @@ func (merger *OutputMerger) AddDecoder(name string, r io.ReadCloser,
 					out := pending[:pos+1]
 					if merger.tee != nil {
 						merger.teeMu.Lock()
-						merger.tee.Write(out)
+						merger.FilterWrite(out)
 						merger.teeMu.Unlock()
 					}
 					select {
@@ -89,7 +116,7 @@ func (merger *OutputMerger) AddDecoder(name string, r io.ReadCloser,
 					pending = append(pending, '\n')
 					if merger.tee != nil {
 						merger.teeMu.Lock()
-						merger.tee.Write(pending)
+						merger.FilterWrite(pending)
 						merger.teeMu.Unlock()
 					}
 					select {
