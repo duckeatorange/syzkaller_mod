@@ -27,7 +27,7 @@ require (
 	github.com/prometheus/client_golang v1.21.1
 	github.com/sergi/go-diff v1.3.2-0.20230802210424-5b0b94c5c0d3
 	github.com/speakeasy-api/git-diff-parser v0.0.3
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.11.0
 	github.com/ulikunitz/xz v0.5.12
 	github.com/vektra/mockery/v2 v2.52.1
 	golang.org/x/exp v0.0.0-20240909161429-701f63a606c0
