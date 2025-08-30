@@ -7,6 +7,7 @@
 ## 修改内容
 
 ### 修改的文件
+- `syzkaller_mod/pkg/config/config.go`
 - `syzkaller_mod/pkg/corpus/`
   - `corpus.go`
   - `prio.go`
